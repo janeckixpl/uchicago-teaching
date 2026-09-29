@@ -16,9 +16,16 @@ Jan Mrozowski, TA for 3 courses fall 2026, teaching 1 course winter 2026.
 - Student text goes through Bedrock only, never direct Anthropic API
 
 ## Autumn 2026 Course IDs
+
+### Canvas
 - 73389 — ADSP 31014 IP03 (TA)
 - 73394 — ADSP 31014 IP11 (TA)
-- 73379 — (co-teacher, not TA)
+- 73379 — ADSP 32030 IP01 (co-teacher, not TA)
+
+### Ed Discussion
+- 107568 — ADSP 31014 IP03 (TA)
+- 107579 — ADSP 31014 IP11 (TA)
+- 107449 — ADSP 32030 IP01 (co-teacher, not TA)
 
 ## Structure
 course/     — per course content
