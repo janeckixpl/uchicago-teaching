@@ -1,0 +1,5 @@
+.uchicago_canvas_token
+.uchicago_ed_token
+*.token
+*.key
+.DS_Store
