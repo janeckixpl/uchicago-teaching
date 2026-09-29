@@ -6,7 +6,7 @@ Jan Mrozowski, TA for 3 courses fall 2026, teaching 1 course winter 2026.
 ## Credentials
 - Canvas API token: ~/.uchicago_canvas_token
 - Canvas base URL: https://canvas.uchicago.edu/api/v1
-- Ed token: ~/.uchicago_ed_token (pending)
+- Ed token: ~/.uchicago_ed_token
 
 ## Rules
 - Never print tokens to screen or logs
