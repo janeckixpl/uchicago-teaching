@@ -270,11 +270,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("page", help="Create or update a Canvas wiki page")
     p.add_argument("--course-id", type=int, required=True, metavar="ID")
     p.add_argument("--title", required=True)
-    p.add_argument(
+    body_group = p.add_mutually_exclusive_group(required=True)
+    body_group.add_argument(
         "--body",
-        required=True,
         metavar="HTML|@FILE",
         help="HTML body text, or @path/to/file.html to read from disk",
+    )
+    body_group.add_argument(
+        "--body-file",
+        dest="body_file",
+        metavar="FILE",
+        help="Path to an HTML file (shorthand for --body @FILE)",
     )
 
     # announcement
@@ -324,10 +330,11 @@ def main() -> None:
     client = CanvasClient()
 
     if args.cmd == "page":
+        body_arg = f"@{args.body_file}" if args.body_file else args.body
         client.upsert_page(
             course_id=args.course_id,
             title=args.title,
-            body=_read_content(args.body),
+            body=_read_content(body_arg),
             published=args.publish,
         )
     elif args.cmd == "announcement":
