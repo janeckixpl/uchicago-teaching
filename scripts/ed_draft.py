@@ -2,21 +2,25 @@
 """
 Ed Discussion draft generator for UChicago TA toolkit.
 
-Pipeline per run:
+Pipeline per run (poll subcommand):
   1. Poll the Ed course board for unanswered questions.
-  2. Classify each question by rule — skip anything touching grades, policy,
-     academic integrity, or direct solution requests.
+  2. Classify each by rule — skip grades, policy, integrity, direct solutions.
+     Skips are written to the queue as status=skipped so the digest can count them.
   3. Retrieve relevant passages from a local knowledge-base directory.
-  4. Draft a TA reply via AWS Bedrock (student text never touches the
-     direct Anthropic API per project rules).
-  5. Append every draft to a JSONL review queue. Nothing is ever posted.
+     If no document meets --min-overlap, write status=needs_context and stop —
+     no Bedrock call is made.
+  4. Draft a TA reply via AWS Bedrock (student text never touches the direct
+     Anthropic API per project rules).
+  5. Append the draft to the JSONL review queue as status=pending.
+     Nothing is ever posted automatically.
 
-To swap the model backend, subclass Drafter and pass it to run().
+To swap the model backend, subclass Drafter and pass it to poll().
 
 Usage:
-    python ed_draft.py --course-id 12345
-    python ed_draft.py --course-id 12345 --kb-dir course/kb/ --limit 20
-    python ed_draft.py --course-id 12345 --dry-run   # classify + retrieve, no Bedrock call
+    python ed_draft.py poll --course-id 12345
+    python ed_draft.py poll --course-id 12345 --min-overlap 5 --dry-run
+    python ed_draft.py digest
+    python ed_draft.py digest --days 14 --queue-file scripts/review_queue.jsonl
 """
 
 import argparse
@@ -24,7 +28,8 @@ import json
 import re
 import sys
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -38,6 +43,7 @@ DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-5-20251001"
 DEFAULT_REGION = "us-east-1"
 DEFAULT_KB_DIR = Path("course/kb")
 DEFAULT_QUEUE = Path("scripts/review_queue.jsonl")
+DEFAULT_MIN_OVERLAP = 3
 
 
 # ── Token ──────────────────────────────────────────────────────────────────────
@@ -56,7 +62,6 @@ def _load_ed_token() -> str:
 class EdClient:
     def __init__(self) -> None:
         self._session = requests.Session()
-        # Token goes into headers only — never printed, never logged
         self._session.headers.update({"x-token": _load_ed_token()})
 
     def _get(self, path: str, params: dict = None) -> dict:
@@ -113,7 +118,6 @@ def classify(title: str, body: str) -> Optional[str]:
     Return a human-readable skip reason, or None if safe to draft.
 
     Checked in order: grades → policy → integrity → direct solution request.
-    Any single match triggers a skip.
     """
     text = (title + " " + body).lower()
     if any(t in text for t in _GRADE_TERMS):
@@ -132,8 +136,7 @@ def classify(title: str, body: str) -> Optional[str]:
 class KnowledgeBase:
     """
     Loads .md / .txt / .html files from kb_dir. Retrieves the top-N documents
-    by unigram overlap with the question — good enough for course material that
-    uses consistent terminology.
+    by unigram overlap with the question, subject to a minimum overlap threshold.
     """
 
     def __init__(self, kb_dir: Path) -> None:
@@ -147,8 +150,11 @@ class KnowledgeBase:
                 self._docs.append({"path": str(path.relative_to(kb_dir)), "text": text})
         print(f"[kb] loaded {len(self._docs)} document(s) from {kb_dir}")
 
-    def retrieve(self, query: str, top_n: int = 3) -> list:
-        """Return top_n docs ranked by token overlap with query."""
+    def retrieve(self, query: str, top_n: int = 3, min_score: int = DEFAULT_MIN_OVERLAP) -> list:
+        """
+        Return top_n docs with overlap >= min_score. Returns [] when no doc
+        meets the threshold — callers must treat an empty result as a hold signal.
+        """
         if not self._docs:
             return []
         q_tokens = set(re.findall(r"\w+", query.lower()))
@@ -156,7 +162,7 @@ class KnowledgeBase:
         for doc in self._docs:
             doc_tokens = set(re.findall(r"\w+", doc["text"].lower()))
             overlap = len(q_tokens & doc_tokens)
-            if overlap > 0:
+            if overlap >= min_score:
                 scored.append((overlap, doc))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [doc for _, doc in scored[:top_n]]
@@ -193,11 +199,7 @@ class BedrockDrafter(Drafter):
         self._model_id = model_id
 
     def draft(self, title: str, body: str, context_chunks: list) -> str:
-        context_block = (
-            "\n\n---\n\n".join(context_chunks)
-            if context_chunks
-            else "(no matching course material found)"
-        )
+        context_block = "\n\n---\n\n".join(context_chunks)
         prompt = (
             "You are a helpful TA for a UChicago course. "
             "A student posted the question below on Ed Discussion.\n\n"
@@ -225,7 +227,7 @@ class BedrockDrafter(Drafter):
 # ── Review queue ───────────────────────────────────────────────────────────────
 
 class ReviewQueue:
-    """Appends draft records to a JSONL file. Nothing is ever posted."""
+    """Appends records to a JSONL file. Nothing is ever posted."""
 
     def __init__(self, path: Path) -> None:
         self._path = path
@@ -234,7 +236,6 @@ class ReviewQueue:
     def append(self, record: dict) -> None:
         with self._path.open("a") as fh:
             fh.write(json.dumps(record) + "\n")
-        print(f"[queued] thread {record['thread_id']} → {self._path}")
 
 
 # ── HTML helper ────────────────────────────────────────────────────────────────
@@ -243,13 +244,18 @@ def _strip_html(html: str) -> str:
     return re.sub(r"<[^>]+>", " ", html).strip()
 
 
-# ── Pipeline ───────────────────────────────────────────────────────────────────
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-def run(
+
+# ── Poll pipeline ──────────────────────────────────────────────────────────────
+
+def poll(
     course_id: int,
     kb_dir: Path,
     queue_file: Path,
     limit: int,
+    min_overlap: int,
     dry_run: bool,
     drafter: Drafter,
 ) -> None:
@@ -260,7 +266,7 @@ def run(
     threads = ed.unanswered_questions(course_id, limit=limit)
     print(f"[poll] {len(threads)} unanswered question(s) on course {course_id}")
 
-    drafted = skipped = 0
+    counts: Counter = Counter()
     for thread in threads:
         thread_id = thread["id"]
         title = thread.get("title", "")
@@ -269,16 +275,38 @@ def run(
         reason = classify(title, body)
         if reason:
             print(f"[skip] thread {thread_id} '{title}' — {reason}")
-            skipped += 1
+            if not dry_run:
+                queue.append({
+                    "thread_id": thread_id,
+                    "title": title,
+                    "timestamp": _now(),
+                    "status": "skipped",
+                    "skip_reason": reason,
+                })
+            counts["skipped"] += 1
             continue
 
-        docs = kb.retrieve(f"{title} {body}")
+        docs = kb.retrieve(f"{title} {body}", min_score=min_overlap)
+
+        if not docs:
+            print(f"[hold] thread {thread_id} '{title}' — no KB match (min_overlap={min_overlap})")
+            if not dry_run:
+                queue.append({
+                    "thread_id": thread_id,
+                    "title": title,
+                    "question": body,
+                    "timestamp": _now(),
+                    "status": "needs_context",
+                })
+            counts["needs_context"] += 1
+            continue
+
         context_chunks = [f"[{d['path']}]\n{d['text'][:800]}" for d in docs]
 
         if dry_run:
-            sources = ", ".join(d["path"] for d in docs) or "none"
+            sources = ", ".join(d["path"] for d in docs)
             print(f"[dry-run] thread {thread_id} '{title}' — context: {sources}")
-            drafted += 1
+            counts["drafted"] += 1
             continue
 
         reply = drafter.draft(title, body, context_chunks)
@@ -288,75 +316,165 @@ def run(
             "question": body,
             "draft": reply,
             "context_files": [d["path"] for d in docs],
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": _now(),
             "status": "pending",
         })
-        drafted += 1
+        print(f"[queued] thread {thread_id} '{title}' → {queue_file}")
+        counts["drafted"] += 1
 
-    print(f"[done] drafted={drafted} skipped={skipped} total={drafted + skipped}")
+    total = sum(counts.values())
+    print(
+        f"[done] drafted={counts['drafted']} "
+        f"needs_context={counts['needs_context']} "
+        f"skipped={counts['skipped']} "
+        f"total={total}"
+    )
+
+
+# ── Digest ─────────────────────────────────────────────────────────────────────
+
+def digest(queue_file: Path, days: int) -> None:
+    if not queue_file.exists():
+        sys.exit(f"error: queue file not found: {queue_file}")
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    records = []
+    with queue_file.open() as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = rec.get("timestamp", "")
+            try:
+                dt = datetime.fromisoformat(ts)
+                if dt < cutoff:
+                    continue
+            except ValueError:
+                continue
+            records.append(rec)
+
+    counts: Counter = Counter(r["status"] for r in records)
+    total = len(records)
+
+    since = cutoff.strftime("%Y-%m-%d")
+    until = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    width = 54
+    print(f"\nDigest — last {days} day(s)  ({since} → {until})")
+    print("─" * width)
+    print(f"  {'drafted (pending)':<28} {counts['pending']:>4}")
+    print(f"  {'held (needs_context)':<28} {counts['needs_context']:>4}")
+    print(f"  {'skipped by classifier':<28} {counts['skipped']:>4}")
+    print(f"  {'─' * 33}")
+    print(f"  {'total':<28} {total:>4}")
+
+    held = [r for r in records if r["status"] == "needs_context"]
+    if held:
+        print(f"\nQuestions needing KB coverage ({len(held)}):")
+        for r in held:
+            date = r.get("timestamp", "")[:10]
+            print(f"  [thread {r['thread_id']}] \"{r['title']}\"  ({date})")
+
+    skipped = [r for r in records if r["status"] == "skipped"]
+    if skipped:
+        print(f"\nSkipped by classifier ({len(skipped)}):")
+        for r in skipped:
+            date = r.get("timestamp", "")[:10]
+            print(f"  [thread {r['thread_id']}] \"{r['title']}\" — {r.get('skip_reason', '?')}  ({date})")
+
+    print()
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description=(
-            "Poll Ed Discussion for unanswered questions, classify by rule, "
-            "retrieve course context, and draft replies via AWS Bedrock. "
-            "All drafts go to a review queue — nothing is posted automatically."
-        ),
+        description="Ed Discussion TA draft tool.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--course-id", type=int, required=True, metavar="ID")
-    parser.add_argument(
-        "--kb-dir",
-        type=Path,
-        default=DEFAULT_KB_DIR,
-        metavar="DIR",
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # poll
+    p = sub.add_parser(
+        "poll",
+        help="Fetch unanswered questions and draft replies",
+        description=(
+            "Poll Ed for unanswered questions, classify by rule, retrieve course "
+            "context, and draft replies via AWS Bedrock. Drafts are written to the "
+            "review queue — nothing is posted. Questions with no KB match above "
+            "--min-overlap are held as needs_context without calling Bedrock."
+        ),
+    )
+    p.add_argument("--course-id", type=int, required=True, metavar="ID")
+    p.add_argument(
+        "--kb-dir", type=Path, default=DEFAULT_KB_DIR, metavar="DIR",
         help=f"Directory of .md/.txt/.html course materials (default: {DEFAULT_KB_DIR})",
     )
-    parser.add_argument(
-        "--queue-file",
-        type=Path,
-        default=DEFAULT_QUEUE,
-        metavar="FILE",
-        help=f"JSONL file to append draft records (default: {DEFAULT_QUEUE})",
+    p.add_argument(
+        "--queue-file", type=Path, default=DEFAULT_QUEUE, metavar="FILE",
+        help=f"JSONL file to append records (default: {DEFAULT_QUEUE})",
     )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=50,
-        metavar="N",
+    p.add_argument(
+        "--limit", type=int, default=50, metavar="N",
         help="Max questions to fetch per run (default: 50)",
     )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Classify and retrieve context but skip the Bedrock call",
+    p.add_argument(
+        "--min-overlap", type=int, default=DEFAULT_MIN_OVERLAP, metavar="N",
+        help=(
+            "Minimum KB token-overlap score required to draft a reply. "
+            f"Questions below this are held as needs_context (default: {DEFAULT_MIN_OVERLAP})"
+        ),
     )
-    parser.add_argument(
-        "--model-id",
-        default=DEFAULT_MODEL,
-        metavar="MODEL",
+    p.add_argument(
+        "--dry-run", action="store_true",
+        help="Classify and retrieve context but skip Bedrock and queue writes",
+    )
+    p.add_argument(
+        "--model-id", default=DEFAULT_MODEL, metavar="MODEL",
         help=f"Bedrock model ID (default: {DEFAULT_MODEL})",
     )
-    parser.add_argument(
-        "--region",
-        default=DEFAULT_REGION,
-        metavar="REGION",
+    p.add_argument(
+        "--region", default=DEFAULT_REGION, metavar="REGION",
         help=f"AWS region for Bedrock (default: {DEFAULT_REGION})",
     )
 
-    args = parser.parse_args()
-    drafter = BedrockDrafter(model_id=args.model_id, region=args.region)
-    run(
-        course_id=args.course_id,
-        kb_dir=args.kb_dir,
-        queue_file=args.queue_file,
-        limit=args.limit,
-        dry_run=args.dry_run,
-        drafter=drafter,
+    # digest
+    d = sub.add_parser(
+        "digest",
+        help="Summarise the review queue for a date window",
+        description=(
+            "Read the review queue and print a summary of drafted, held, and "
+            "skipped questions. Lists needs_context titles so you know which "
+            "topics to add to the knowledge base."
+        ),
     )
+    d.add_argument(
+        "--queue-file", type=Path, default=DEFAULT_QUEUE, metavar="FILE",
+        help=f"JSONL queue file to read (default: {DEFAULT_QUEUE})",
+    )
+    d.add_argument(
+        "--days", type=int, default=7, metavar="N",
+        help="Number of days to look back (default: 7)",
+    )
+
+    args = parser.parse_args()
+
+    if args.cmd == "poll":
+        drafter = BedrockDrafter(model_id=args.model_id, region=args.region)
+        poll(
+            course_id=args.course_id,
+            kb_dir=args.kb_dir,
+            queue_file=args.queue_file,
+            limit=args.limit,
+            min_overlap=args.min_overlap,
+            dry_run=args.dry_run,
+            drafter=drafter,
+        )
+    elif args.cmd == "digest":
+        digest(queue_file=args.queue_file, days=args.days)
 
 
 if __name__ == "__main__":
