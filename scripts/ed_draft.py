@@ -62,7 +62,10 @@ def _load_ed_token() -> str:
 class EdClient:
     def __init__(self) -> None:
         self._session = requests.Session()
-        self._session.headers.update({"Authorization": f"Bearer {_load_ed_token()}"})
+        self._session.headers.update({
+            "Authorization": f"Bearer {_load_ed_token()}",
+            "User-Agent": "Mozilla/5.0",
+        })
 
     def _get(self, path: str, params: dict = None) -> dict:
         resp = self._session.get(f"{ED_BASE_URL}{path}", params=params)
