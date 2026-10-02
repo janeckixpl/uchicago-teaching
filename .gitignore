@@ -4,3 +4,4 @@
 *.key
 .DS_Store
 scripts/review_queue.jsonl
+grades/
